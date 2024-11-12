@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+
+#
+# install-tool: takes as argument a name of a script in this directory and setups a symlink in my bin dir (~/.bin)
+#
+
+set -eou pipefail
+
+# Check if the correct number of arguments is provided
+if [ "$#" -ne 1 ]; then
+    echo "Usage: $0 <path-to-script>"
+    exit 1
+fi
+
+SCRIPT_PATH=./"$1"
+BIN_DIR="$HOME/.bin"
+
+# Check if the provided path is a file
+if [ ! -f "$SCRIPT_PATH" ]; then
+    echo "Error: $SCRIPT_PATH is not a valid file."
+    exit 1
+fi
+
+# Create the bin directory if it doesn't exist
+if [ ! -d "$BIN_DIR" ]; then
+    mkdir -p "$BIN_DIR" || { echo "Error: Failed to create directory $BIN_DIR."; exit 1; }
+fi
+
+# Get the absolute path of the script
+ABS_SCRIPT_PATH=$(realpath "$SCRIPT_PATH")
+
+# Get the script name
+SCRIPT_NAME=$(basename "$SCRIPT_PATH")
+
+# Create the symlink in the bin directory
+ln -v -sf "$ABS_SCRIPT_PATH" "$BIN_DIR/$SCRIPT_NAME"

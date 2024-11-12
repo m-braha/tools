@@ -1,0 +1,613 @@
+#!/usr/bin/env bash
+# 
+# qman: manage qemu vms
+# Run without arguments to see help or read it there ⬇️
+#
+
+set -eou pipefail
+
+function print_help() {
+    gum format <<'EOF'
+# qman - QEMU VM Manager
+
+## Usage
+qman [-d] [command] [options]
+
+&nbsp;&nbsp;**-d**: Enable debug mode.
+
+## Commands
+`create disk.qcow2 [-n [name]]`
+Create a new VM from a qcow2 disk image.
+&nbsp;&nbsp;**-n [name]**: Specify the name of the VM, else it's derived from the disk image name.
+
+`up name [-c] [-s] [-init [userdata]]`
+Start the VM specified by name.
+&nbsp;&nbsp;**-c**: Start the VM in console mode.
+&nbsp;&nbsp;**-s**: Start the VM in silent mode.
+&nbsp;&nbsp;**-init [userdata]**: Specify the cloud-init userdata file. Else a sane default is used.
+
+`exec name [-p] command`
+Execute a command on the VM specified by name.
+&nbsp;&nbsp;**-p**: Use a pager for the output.
+
+`kill name`
+Stop the VM specified by name.
+
+`ssh name`
+SSH into the VM specified by name.
+
+`destroy name [-f]`
+Destroy the VM specified by name.
+&nbsp;&nbsp;**-f**: Force destroy without confirmation.
+
+`nuke`
+⚠️ Delete all qman data! ⚠️
+
+`list`
+List all VMs and their statuses.
+
+EOF
+}
+
+#*
+#* Configuration data
+#* 
+DATA_DIR="$HOME/.local/share/qman/images"
+CONFIG_DIR="$HOME/.config/qman"
+GLOBAL_SHARED_DIR="$HOME/.local/share/qman/shared"
+DEBUG=false
+MEMORY=4096
+CPUS=2
+
+PUBLIC_KEY=$(find ~/.ssh -type f -name "*.pub" -print0 | xargs -0 ls -t | head -n 1 | xargs cat)
+QMAN_PROMPT='$(XIT=$?; if [ "$USER" = "root" ]; then COLOR="\[\033[1;31m\]"; else COLOR="\[\033[0;34m\]"; fi; echo -n "${COLOR}\u\[\033[0;33m\]@\[\033[0;36m\]\h\[\033[0m\] "; [ "$XIT" -ne 0 ] && echo -n "\[\033[1;31m\]➜ " || echo -n "\[\033[0m\]➜ "; echo -n "\[\033[1;34m\]\w \[\033[0m\]$ ")'
+DEFAULT_USERDATA=$(cat <<EOF
+#cloud-config
+ssh_authorized_keys:
+- $PUBLIC_KEY
+
+write_files:
+  - path: /etc/selinux/config
+    permissions: "0644"
+    content: |
+      SELINUX=disabled
+      SELINUXTYPE=targeted
+  - path: /etc/profile.d/prompt.sh
+    permissions: "0644"
+    owner: root:wheel
+    content: |
+        export PS1='$QMAN_PROMPT'
+runcmd:
+  - setenforce 0
+  - mkdir -p /share
+  - mount -t 9p -o trans=virtio data_share /share
+  - chown fedora:fedora /share
+mounts:
+  - [data_share, /share, "9p", "trans=virtio,defaults", "0", "0"]
+EOF
+)
+
+DEFAULT_METADATA=$(cat <<'EOF'
+instance-id: $name
+local-hostname: $name
+EOF
+)
+
+#*
+#* Helper functions
+#*
+# Check if arg exists, exit with message if not
+check_bin_exists() {
+
+    # palette from Rose Pine
+    RED='\x1b[38;2;235;111;146m'
+    YELLOW='\x1b[38;2;246;193;119m'
+    PURPLE='\x1b[38;2;196;167;231m'
+    RST=$(tput sgr0)
+    BOLD=$(tput bold)
+    if ! command -V "$1" &>/dev/null; then
+        echo -e "${PURPLE}qman ${RED}requires ${YELLOW}${BOLD}${1}${RST}${RED} to be installed!. Exiting..\n${RST}" >&2
+        exit 1
+    fi
+}
+
+mkdir -p "$DATA_DIR"
+mkdir -p "$CONFIG_DIR"
+mkdir -p "$GLOBAL_SHARED_DIR"
+
+# Dependencies check
+for cmd in gum jq qemu-img qemu-system-aarch64; do
+    check_bin_exists $cmd
+done
+
+# Helper functions
+function format() {
+    gum format --theme dracula "$@"
+}
+
+#! Command functions
+function cmd_create() {
+    local args=("$@")
+    local disk_image=""
+    local name=""
+    local disk_size="40G"
+
+    # Parse arguments
+    while [[ "${#args[@]}" -gt 0 ]]; do
+        case "${args[0]}" in
+            -n)
+                name="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            -s)
+                disk_size="${args[1]}"
+                args=("${args[@]:2}")
+                ;;
+            *)
+                if [[ -z "$disk_image" ]]; then
+                    disk_image="${args[0]}"
+                    args=("${args[@]:1}")
+                else
+                    format "**Error:** Unknown argument: ${args[0]}"
+                    exit 1
+                fi
+                ;;
+        esac
+    done
+
+    if [[ -z "$disk_image" ]]; then
+        format "**Error:** Disk image is required."
+        exit 1
+    fi
+
+    if [[ ! -f "$disk_image" ]]; then
+        format "**Error:** Disk image '$disk_image' not found."
+        exit 1
+    fi
+
+    # Determine the VM name
+    if [[ -z "$name" ]]; then
+        name="$(basename "$disk_image" .qcow2)"
+    fi
+
+    # Create VM config directory
+    local vm_config_dir="$CONFIG_DIR/$name"
+    mkdir -p "$vm_config_dir"
+
+    # Create VM data directory
+    local vm_data_dir="$DATA_DIR/$name"
+    mkdir -p "$vm_data_dir"
+
+    # Move user-provided disk image to data directory
+    base=$(basename "$disk_image")
+    local vm_disk="$vm_data_dir/$base"
+    cp "$disk_image" "$vm_disk"
+
+    # Create a new qcow2 disk backing onto the provided disk image
+    local vm_disk_qcow2="$vm_data_dir/disk.qcow2"
+    [[ $DEBUG == true ]] && set -x
+    qemu-img create -f qcow2 -b "$vm_disk" -F qcow2 "$vm_disk_qcow2" "$disk_size"
+    set +x
+
+    # Generate ssh and vnc ports
+    local ssh_port
+    ssh_port=$(shuf -i 2222-65535 -n 1)
+    local vnc_port
+    vnc_port=$(shuf -i 5900-5999 -n 1)
+
+    # Create config file
+    local config_file="$vm_config_dir/config.json"
+    cat > "$config_file" <<EOF
+{
+    "name": "$name",
+    "disk": "$vm_disk_qcow2",
+    "backing_file": "$vm_disk",
+    "ssh_port": $ssh_port,
+    "vnc_port": $vnc_port
+}
+EOF
+
+    format "**Success:** VM '$name' created."
+}
+
+function cmd_up() {
+    local name="$1"
+    shift
+    local mode="normal"
+    local cloud_init_userdata=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -c)
+                mode="console"
+                shift
+                ;;
+            -s)
+                mode="silent"
+                shift
+                ;;
+            -init)
+                cloud_init_userdata="${2:-$CONFIG_DIR/default_userdata}"
+                # if using default shift 1, else shift 2
+                if [[ "$cloud_init_userdata" == "$CONFIG_DIR/default_userdata" ]]; then
+                    # Write the default userdata to a file
+                    echo "$DEFAULT_USERDATA" > "$cloud_init_userdata"
+                    shift
+                else
+                    shift 2
+                fi
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        format "**Error:** VM name is required."
+        exit 1
+    fi
+
+    local config_file="$CONFIG_DIR/$name/config.json"
+    if [[ ! -f "$config_file" ]]; then
+        format "**Error:** VM '$name' not found."
+        exit 1
+    fi
+
+    # Read config
+    local disk ssh_port vnc_port
+    disk=$(jq -r '.disk' "$config_file")
+    ssh_port=$(jq -r '.ssh_port' "$config_file")
+    vnc_port=$(jq -r '.vnc_port' "$config_file")
+
+    local vm_data_dir="$DATA_DIR/$name"
+
+    # Check if VM is already running
+    if [[ -f "$vm_data_dir/pid" ]]; then
+        local pid
+        pid=$(cat "$vm_data_dir/pid")
+        if ps -p "$pid" > /dev/null 2>&1; then
+            format "**Info:** VM '$name' is already running."
+            exit 0
+        else
+            rm "$vm_data_dir/pid"
+        fi
+    fi
+
+    # Handle cloud-init
+    if [[ -n "$cloud_init_userdata" ]]; then
+        if [[ ! -f "$cloud_init_userdata" ]]; then
+            format "**Error:** Cloud-init userdata file '$cloud_init_userdata' not found."
+            exit 1
+        fi
+
+        # Generate metadata file
+        local metadata_file="$CONFIG_DIR/$name/meta-data"
+        echo "${DEFAULT_METADATA//\$name/$name}" > "$metadata_file"
+
+        # Copy userdata
+        local userdata_file="$CONFIG_DIR/$name/user-data"
+        cp "$cloud_init_userdata" "$userdata_file"
+
+        # Create ISO using xorriso
+        local cloud_init_iso="$vm_data_dir/cloud-init.iso"
+        [ -f "$cloud_init_iso" ] && rm "$cloud_init_iso"
+        gum spin -- xorriso -as mkisofs -o "$cloud_init_iso" -V cidata -r -J "$userdata_file" "$metadata_file"
+    fi
+
+    # Build qemu command
+    local qemu_cmd=("qemu-system-aarch64"
+        "-m" "$MEMORY"
+        "-smp" "$CPUS"
+        "-cpu" "host"
+        "-M" "virt,accel=hvf"
+        "-drive" "file=$disk,format=qcow2,if=virtio,cache=writeback"
+        "-bios" "/opt/homebrew/share/qemu/edk2-aarch64-code.fd"
+        "-boot" "c"
+        "-device" "virtio-keyboard-pci"
+        "-net" "nic"
+        "-net" "user,hostfwd=tcp::${ssh_port}-:22"
+        "-pidfile" "$vm_data_dir/pid"
+        "-fsdev" "local,id=data,path=$GLOBAL_SHARED_DIR,security_model=mapped"
+        "-device" "virtio-9p-pci,fsdev=data,mount_tag=data_share")
+
+    case "$mode" in
+        normal)
+            qemu_cmd+=("-display" "cocoa" "-device" "virtio-gpu-pci" )
+            ;;
+        console)
+            qemu_cmd+=("-nographic")
+            ;;
+        silent)
+            qemu_cmd+=("-vnc" ":$vnc_port")
+            ;;
+    esac
+
+    # Attach cloud-init if exists
+    if [[ -f "$vm_data_dir/cloud-init.iso" ]]; then
+        qemu_cmd+=("-cdrom" "$vm_data_dir/cloud-init.iso")
+    fi
+
+    # Start VM
+    [[ $DEBUG == true ]] && set -x
+    if [[ "$mode" != "console" ]]; then
+        "${qemu_cmd[@]}" &
+        format "**Success:** VM '$name' started."
+    else
+        "${qemu_cmd[@]}"
+    fi
+    set +x
+
+    wait_for_vm "$ssh_port"
+}
+
+# Function to check if VM is ready
+wait_for_vm() {
+    local ssh_port=$1
+    local max_attempts=60
+    local attempt=1
+
+    echo "Waiting for VM to be ready on port $ssh_port..."
+
+    while ! nc -z localhost "$ssh_port"; do
+        if [[ $attempt -ge $max_attempts ]]; then
+            echo "VM did not become ready in time."
+            exit 1
+        fi
+        sleep 2
+        attempt=$((attempt + 1))
+    done
+
+    echo "VM is now ready."
+}
+
+function cmd_kill() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        format "**Error:** VM name is required."
+        exit 1
+    fi
+
+    local vm_data_dir="$DATA_DIR/$name"
+    if [[ ! -d "$vm_data_dir" ]]; then
+        format "**Error:** VM '$name' not found."
+        exit 1
+    fi
+
+    if [[ ! -f "$vm_data_dir/pid" ]]; then
+        format "**Error:** VM '$name' is not running."
+        exit 1
+    fi
+
+    local pid
+    pid=$(cat "$vm_data_dir/pid")
+    if ps -p "$pid" > /dev/null 2>&1; then
+        kill "$pid"
+        rm -f "$vm_data_dir/pid" &>/dev/null
+        format "**Success:** VM '$name' stopped."
+    else
+        format "**Error:** VM '$name' is not running."
+        rm "$vm_data_dir/pid"
+    fi
+}
+
+function cmd_ssh() {
+    local name="$1"
+
+    if [[ -z "$name" ]]; then
+        format "**Error:** VM name is required."
+        exit 1
+    fi
+
+    local config_file="$CONFIG_DIR/$name/config.json"
+    if [[ ! -f "$config_file" ]]; then
+        format "**Error:** VM '$name' not found."
+        exit 1
+    fi
+
+    # Read ssh_port
+    local ssh_port
+    ssh_port=$(jq -r '.ssh_port' "$config_file")
+
+    # Open SSH connection
+    [ ${DEBUG} == true ] && set -x
+    kitten ssh -p "$ssh_port" fedora@localhost
+    set +x
+}
+
+function cmd_destroy() {
+    local name="$1"
+    local force=false
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f)
+                force=true
+                shift
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
+    if [[ -z "$name" ]]; then
+        format "**Error:** VM name is required."
+        exit 1
+    fi
+
+    local vm_data_dir="$DATA_DIR/$name"
+    local vm_config_dir="$CONFIG_DIR/$name"
+
+    if [[ ! -d "$vm_data_dir" ]] && [[ ! -d "$vm_config_dir" ]]; then
+        format "**Error:** VM '$name' not found."
+        exit 1
+    fi
+
+    if [[ -f "$vm_data_dir/pid" ]]; then
+        cmd_kill "$name"
+    fi
+
+    if [[ "$force" == false ]]; then
+        gum confirm "Are you sure you want to destroy VM '$name'?" || exit 0
+    fi
+
+    rm -rf "$vm_data_dir" "$vm_config_dir"
+    format "**Success:** VM '$name' destroyed."
+}
+function cmd_list() {
+    local vms=()
+    local vm_status
+    local ssh_port
+
+    # Collect VM names
+    for vm_data_dir in "$DATA_DIR"/*; do
+        if [[ -d "$vm_data_dir" ]]; then
+            vms+=("$(basename "$vm_data_dir")")
+        fi
+    done
+
+    if [[ ${#vms[@]} -eq 0 ]]; then
+        format "**Info:** No VMs found."
+        exit 0
+    fi
+
+    # Build the header
+    output=("| VM Name | Status | SSH Port |" "| --- | --- | --- |")
+
+    # Check status and build the output for each VM
+    for vm in "${vms[@]}"; do
+        if [[ -f "$DATA_DIR/$vm/pid" ]]; then
+            local pid
+            pid=$(cat "$DATA_DIR/$vm/pid")
+            if ps -p "$pid" > /dev/null 2>&1; then
+                vm_status="Running"
+            else
+                vm_status="Stopped (stale pid)"
+            fi
+        else
+            vm_status="Stopped"
+        fi
+
+        # Get SSH port from config
+        local config_file="$CONFIG_DIR/$vm/config.json"
+        if [[ -f "$config_file" ]]; then
+            ssh_port=$(jq -r '.ssh_port' "$config_file")
+        else
+            ssh_port="N/A"
+        fi
+
+        output+=("| $vm | $vm_status | $ssh_port |")
+    done
+
+    # Print the output
+    format "${output[@]}"
+}
+
+function cmd_exec() {
+    local name="$1"
+    shift
+    local paging=false
+
+    if [[ "$1" == "-p" ]]; then
+        paging=true
+        shift
+    fi
+
+    if [[ -z "$name" ]]; then
+        format "**Error:** VM name is required."
+        exit 1
+    fi
+
+    local config_file="$CONFIG_DIR/$name/config.json"
+    if [[ ! -f "$config_file" ]]; then
+        format "**Error:** VM '$name' not found."
+        exit 1
+    fi
+
+    local ssh_port
+    ssh_port=$(jq -r '.ssh_port' "$config_file")
+    if [[ "$ssh_port" == "null" || -z "$ssh_port" ]]; then
+        format "**Error:** SSH port not found for VM '$name'."
+        exit 1
+    fi
+
+    local ssh_command="ssh -p $ssh_port fedora@localhost"
+
+    if [[ "$paging" == true ]]; then
+        $ssh_command "$@" | gum pager
+    else
+        $ssh_command "$@"
+    fi
+}
+
+function cmd_nuke() {
+    # remove all things qman
+    gum confirm "Really delete all traces of qman?" || exit 0
+    
+    rm -rf "$DATA_DIR" "$CONFIG_DIR" "$GLOBAL_SHARED_DIR"
+    format "**Success:** All qman data removed."
+}
+#! Main
+if [[ $# -eq 0 ]]; then
+    print_help
+    exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -d)
+            DEBUG=true
+            shift
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+# Get the command (first positional argument)
+COMMAND="${1:-}"
+shift
+
+# Execute the corresponding command
+case "$COMMAND" in
+    create)
+        cmd_create "$@"
+        ;;
+    up)
+        cmd_up "$@"
+        ;;
+    kill)
+        cmd_kill "$@"
+        ;;
+    ssh)
+        cmd_ssh "$@"
+        ;;
+    destroy)
+        cmd_destroy "$@"
+        ;;
+    list)
+        cmd_list
+        ;;
+    exec)
+        cmd_exec "$@"
+        ;;
+    nuke)
+        cmd_nuke
+        ;;
+    show-defaults)
+        gum format <<EOF
+## Default cloud-init userdata:
+$DEFAULT_USERDATA
+## Default cloud-init userdata location
+$CONFIG_DIR/default_userdata
+## Default cloud-init metadata:
+$DEFAULT_METADATA
+EOF
+        ;;
+    *)
+        print_help
+        ;;
+esac

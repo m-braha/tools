@@ -1,0 +1,32 @@
+{
+    "notes": "2gNMYEf3AWX/90h483r9sdfhviwne0r81onwuhf/19F4r+RqqZOhV5Xvw==",
+    "accesssctrlconfigured": "false",
+    "accounttype": "278960000016",
+    "description": "",
+    "userid": "278960409013",
+    "istrashed": false,
+    "secretData": "{\"password\":\"foo=\",\"file\":\"2ANxGef3AWU=\",\"username\":\"bar\"}",
+    "displayaccctrlicon": false,
+    "isfavourites": false,
+    "secreturl": "",
+    "policyid": "27896000829251",
+    "autosubmit": true,
+    "onetimeacess": false,
+    "sharinglevel": 30,
+    "sharingtype": "SHARED_TO_ME",
+    "changepassword": false,
+    "issharedtousers": true,
+    "isshared": "YES",
+    "customcolumn": "eyJjdXN0b21jb2wiOltdfQ==",
+    "secretid": "27896001546555",
+    "classification": "E",
+    "ownerdetails": {
+        "USERNAME": "bobby bob",
+        "EMAIL": "bobby@bob.com"
+    },
+    "autologon": false,
+    "tags": "",
+    "requeststatus": -1,
+    "creationtime": 1683066047932,
+    "secretname": "Target Foo - platform-read"
+}

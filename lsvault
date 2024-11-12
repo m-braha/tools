@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+
+#
+# lsvault: list secrets in ZoHo vault
+#
+
+set -eou pipefail
+
+# Ensure gum is installed
+if ! command -v gum &> /dev/null; then
+    echo "gum is required to run this script. Please install gum."
+    exit 1
+fi
+
+# Ensure jq is installed
+if ! command -v jq &> /dev/null; then
+    echo "jq is required to run this script. Please install jq."
+    exit 1
+fi
+
+# Ensure the user is logged in to ZoHo vault. This is a one-time operation.
+if zv list category 2>&1 | grep -q "not logged in"; then
+    zv login --config-path ~/.config
+fi
+
+# Ensure the vault is unlocked. 
+if zv list category 2>&1 | grep -q -i "Please Login into ZoHo Vault"; then
+    zv unlock
+fi
+
+# fetch all the secrets
+# this specific invocation of search "tricks" zoho into returning all data
+# secrets_json=$(zv search -k " " -V -o json)
+secrets_json=$(cat secrets.json)
+
+# verify we got a sensible json response , exit if not
+if ! echo "$secrets_json" | jq -e > /dev/null 2>&1; then
+    echo "Invalid JSON received. Exiting."
+    exit 1
+fi
+
+# Show the user their secrets and let them pick one.
+selected_entry=$(echo "$secrets_json" | jq -r '.[] | "\(.secretname)"' | sort | gum choose --ordered --height 10)
+
+# After the user selects a secretname, search the JSON for the respective secretData.
+echo "$secrets_json" | jq -r --arg selected_entry "$selected_entry" '.[] | select(.secretname == $selected_entry) | .secretData' | jq

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Wrapper script for zv that deletes generated error.log files and ensures execution from a controlled directory
+
+# Define the controlled directory
+CONTROLLED_DIR="$HOME/.bin"
+
+# Save the current directory and change to the controlled directory
+pushd "$CONTROLLED_DIR" > /dev/null || exit 1
+
+# Run zv with any provided arguments
+./zv.x86_64 "$@"
+
+# Check if error.log was generated in the controlled directory
+[ -f error.log ] && rm -f error.log
+
+# Return to the original directory
+popd &> /dev/null || exit 1

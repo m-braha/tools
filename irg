@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+#
+# irg: interactive ripgrep
+# A simple script to search for files using ripgrep, fzf, and bat.
+#
+
+# Define the excludes
+EXCLUDES=(
+    --glob '!Library/*'
+    --glob '!Applications/*'
+)
+
+# Run the command
+rg --color=always --line-number --no-heading --smart-case "${EXCLUDES[@]}" "${*:-}" | \
+fzf --ansi --color "hl:-1:underline,hl+:-1:underline:reverse" --delimiter : \
+    --preview 'bat --color=always {1} --highlight-line {2}' \
+    --preview-window 'up,60%,border-bottom,+{2}+3/3,~3' \
+    --bind 'enter:become(nvim {1} +{2})'
