@@ -6,8 +6,9 @@
 
 set -eou pipefail
 
+# Render the help Markdown text
 function print_help() {
-    gum format <<'EOF'
+    format <<'EOF'
 # qman - QEMU VM Manager
 
 ## Usage
@@ -40,6 +41,9 @@ SSH into the VM specified by name.
 Destroy the VM specified by name.
 &nbsp;&nbsp;**-f**: Force destroy without confirmation.
 
+`show-defaults`
+Show default data used by qman.
+
 `nuke`
 ⚠️ Delete all qman data! ⚠️
 
@@ -52,19 +56,36 @@ EOF
 #*
 #* Configuration data
 #* 
-DATA_DIR="$HOME/.local/share/qman/images"
+# Where to store large data
+DATA_DIR="$HOME/.local/share/qman"
+# VM image live here
+IMAGES_DIR="$DATA_DIR/images"
+# VM config live here
 CONFIG_DIR="$HOME/.config/qman"
-GLOBAL_SHARED_DIR="$HOME/.local/share/qman/shared"
+# Global share between VMs and host
+GLOBAL_SHARED_DIR="$DATA_DIR/shared"
+# Enable debug output
 DEBUG=false
+# VM defaults
 MEMORY=4096
 CPUS=2
+QMAN_SSH_USER="quser"
 
+# Find a public key to use for cloud-init
 PUBLIC_KEY=$(find ~/.ssh -type f -name "*.pub" -print0 | xargs -0 ls -t | head -n 1 | xargs cat)
+# Default cloud-init userdata
 QMAN_PROMPT='$(XIT=$?; if [ "$USER" = "root" ]; then COLOR="\[\033[1;31m\]"; else COLOR="\[\033[0;34m\]"; fi; echo -n "${COLOR}\u\[\033[0;33m\]@\[\033[0;36m\]\h\[\033[0m\] "; [ "$XIT" -ne 0 ] && echo -n "\[\033[1;31m\]➜ " || echo -n "\[\033[0m\]➜ "; echo -n "\[\033[1;34m\]\w \[\033[0m\]$ ")'
 DEFAULT_USERDATA=$(cat <<EOF
 #cloud-config
 ssh_authorized_keys:
 - $PUBLIC_KEY
+
+users:
+- name: $QMAN_SSH_USER
+  sudo: ALL=(ALL) NOPASSWD:ALL
+  groups: wheel
+  home: /home/$QMAN_SSH_USER
+  shell: /bin/bash
 
 write_files:
   - path: /etc/selinux/config
@@ -81,7 +102,7 @@ runcmd:
   - setenforce 0
   - mkdir -p /share
   - mount -t 9p -o trans=virtio data_share /share
-  - chown fedora:fedora /share
+  - chown $QMAN_SSH_USER:wheel /share
 mounts:
   - [data_share, /share, "9p", "trans=virtio,defaults", "0", "0"]
 EOF
@@ -96,7 +117,7 @@ EOF
 #*
 #* Helper functions
 #*
-# Check if arg exists, exit with message if not
+# Check if binary exists, exit with message if not
 check_bin_exists() {
 
     # palette from Rose Pine
@@ -120,12 +141,13 @@ for cmd in gum jq qemu-img qemu-system-aarch64; do
     check_bin_exists $cmd
 done
 
-# Helper functions
 function format() {
     gum format --theme dracula "$@"
 }
 
 #! Command functions
+# Create a new VM from a disk image. The disk image is copied to the VM data directory and a new qcow2 disk is created
+# backing onto the original disk image. A config file is created in the VM config directory.
 function cmd_create() {
     local args=("$@")
     local disk_image=""
@@ -175,7 +197,7 @@ function cmd_create() {
     mkdir -p "$vm_config_dir"
 
     # Create VM data directory
-    local vm_data_dir="$DATA_DIR/$name"
+    local vm_data_dir="$IMAGES_DIR/$name"
     mkdir -p "$vm_data_dir"
 
     # Move user-provided disk image to data directory
@@ -210,12 +232,14 @@ EOF
     format "**Success:** VM '$name' created."
 }
 
+# Start a VM, in various graphics modes
 function cmd_up() {
     local name="$1"
     shift
     local mode="normal"
     local cloud_init_userdata=""
 
+    # Parse arguments
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -c)
@@ -260,7 +284,7 @@ function cmd_up() {
     ssh_port=$(jq -r '.ssh_port' "$config_file")
     vnc_port=$(jq -r '.vnc_port' "$config_file")
 
-    local vm_data_dir="$DATA_DIR/$name"
+    local vm_data_dir="$IMAGES_DIR/$name"
 
     # Check if VM is already running
     if [[ -f "$vm_data_dir/pid" ]]; then
@@ -289,7 +313,7 @@ function cmd_up() {
         local userdata_file="$CONFIG_DIR/$name/user-data"
         cp "$cloud_init_userdata" "$userdata_file"
 
-        # Create ISO using xorriso
+        # Create ISO
         local cloud_init_iso="$vm_data_dir/cloud-init.iso"
         [ -f "$cloud_init_iso" ] && rm "$cloud_init_iso"
         gum spin -- xorriso -as mkisofs -o "$cloud_init_iso" -V cidata -r -J "$userdata_file" "$metadata_file"
@@ -361,6 +385,7 @@ wait_for_vm() {
     echo "VM is now ready."
 }
 
+# Force kill a VM by name
 function cmd_kill() {
     local name="$1"
 
@@ -392,6 +417,7 @@ function cmd_kill() {
     fi
 }
 
+# SSH into a VM by name
 function cmd_ssh() {
     local name="$1"
 
@@ -412,10 +438,11 @@ function cmd_ssh() {
 
     # Open SSH connection
     [ ${DEBUG} == true ] && set -x
-    kitten ssh -p "$ssh_port" fedora@localhost
+    ssh -p "$ssh_port" $QMAN_SSH_USER@localhost
     set +x
 }
 
+# Destroy a VM by name
 function cmd_destroy() {
     local name="$1"
     local force=false
@@ -456,13 +483,15 @@ function cmd_destroy() {
     rm -rf "$vm_data_dir" "$vm_config_dir"
     format "**Success:** VM '$name' destroyed."
 }
+
+# List all VMs and their statuses
 function cmd_list() {
     local vms=()
     local vm_status
     local ssh_port
 
     # Collect VM names
-    for vm_data_dir in "$DATA_DIR"/*; do
+    for vm_data_dir in "$IMAGES_DIR"/*; do
         if [[ -d "$vm_data_dir" ]]; then
             vms+=("$(basename "$vm_data_dir")")
         fi
@@ -505,6 +534,7 @@ function cmd_list() {
     format "${output[@]}"
 }
 
+# Execute a command on a VM by name
 function cmd_exec() {
     local name="$1"
     shift
@@ -542,6 +572,7 @@ function cmd_exec() {
     fi
 }
 
+# Delete all qman data
 function cmd_nuke() {
     # remove all things qman
     gum confirm "Really delete all traces of qman?" || exit 0
@@ -599,11 +630,13 @@ case "$COMMAND" in
         ;;
     show-defaults)
         gum format <<EOF
-## Default cloud-init userdata:
-$DEFAULT_USERDATA
+## Default configuration data
+$CONFIG_DIR
+## Default data directory
+$DATA_DIR
 ## Default cloud-init userdata location
 $CONFIG_DIR/default_userdata
-## Default cloud-init metadata:
+## Default cloud-init metadata
 $DEFAULT_METADATA
 EOF
         ;;
