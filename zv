@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Wrapper script for zv that deletes generated error.log files and ensures execution from a controlled directory
+# Assumes zv is installed in the controlled directory and called zv.x86_64
 
 # Define the controlled directory
 CONTROLLED_DIR="$HOME/.bin"
